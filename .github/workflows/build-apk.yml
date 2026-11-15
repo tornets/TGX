@@ -1,0 +1,72 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Read build versions
+        id: versions
+        run: |
+          {
+            echo "ndk=$(grep '^version.ndk_primary=' version.properties | cut -d= -f2)"
+            echo "build_tools=$(grep '^version.build_tools=' version.properties | cut -d= -f2)"
+            echo "platform=$(grep '^version.sdk_package=' version.properties | cut -d= -f2)"
+            echo "cmake=$(grep '^version.cmake=' version.properties | cut -d= -f2)"
+            echo "rust=$(grep '^version.rust=' version.properties | cut -d= -f2)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install Android SDK components
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;${{ steps.versions.outputs.platform }}" \
+            "build-tools;${{ steps.versions.outputs.build_tools }}" \
+            "ndk;${{ steps.versions.outputs.ndk }}" \
+            "cmake;${{ steps.versions.outputs.cmake }}" > /dev/null
+
+      - name: Install Rust with Android targets
+        run: |
+          rustup toolchain install "${{ steps.versions.outputs.rust }}" --profile minimal \
+            --target aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Generate google-services file for com.tornets.tgx
+        run: |
+          python3 - <<'EOF'
+          import json
+          d = json.load(open('app/google-services.json'))
+          for c in d['client']:
+              c['client_info']['android_client_info']['package_name'] = 'com.tornets.tgx'
+          json.dump(d, open('google-services-tornets.json', 'w'), indent=2)
+          EOF
+
+      - name: Create local.properties
+        run: |
+          cat > local.properties <<EOF
+          sdk.dir=$ANDROID_HOME
+          rust.dir=$(rustup show home)
+          app.id=com.tornets.tgx
+          app.name=TGX
+          google_services.file=google-services-tornets.json
+          EOF
+          cat local.properties
+
+      - name: Build debug APK (arm64)
+        run: ./gradlew :app:assembleLatestDebug -Pabi=arm64 --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: tgx-apk
+          path: app/build/outputs/apk/latest/debug/*.apk
+          if-no-files-found: error
