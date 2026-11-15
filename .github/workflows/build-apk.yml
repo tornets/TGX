@@ -58,6 +58,9 @@ jobs:
           EOF
 
       - name: Create local.properties
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
         run: |
           cat > local.properties <<EOF
           sdk.dir=$ANDROID_HOME
@@ -65,6 +68,8 @@ jobs:
           app.id=com.tornets.tgx
           app.name=TGX
           google_services.file=google-services-tornets.json
+          telegram.api_id=${TG_API_ID:-94575}
+          telegram.api_hash=${TG_API_HASH:-a3406de8d171bb422bb6ddf3bbd800e2}
           EOF
           cat local.properties
 
