@@ -23,6 +23,7 @@ import android.graphics.Path;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.drawable.Drawable;
+import android.media.MediaMetadataRetriever;
 import android.os.Build;
 import android.os.SystemClock;
 import android.text.Editable;
@@ -121,6 +122,7 @@ import org.thunderdog.challegram.navigation.ViewController;
 import org.thunderdog.challegram.support.ViewSupport;
 import org.thunderdog.challegram.telegram.CallManager;
 import org.thunderdog.challegram.telegram.DateChangeListener;
+import org.thunderdog.challegram.telegram.FileUpdateListener;
 import org.thunderdog.challegram.telegram.MessageListener;
 import org.thunderdog.challegram.telegram.RightId;
 import org.thunderdog.challegram.telegram.TGLegacyManager;
@@ -165,9 +167,13 @@ import org.thunderdog.challegram.widget.TextFormattingLayout;
 import org.thunderdog.challegram.widget.VideoTimelineView;
 
 import java.io.File;
+import java.io.RandomAccessFile;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import me.vkryl.android.AnimatorUtils;
 import me.vkryl.android.ScrimUtil;
@@ -183,6 +189,7 @@ import me.vkryl.core.ColorUtils;
 import me.vkryl.core.MathUtils;
 import me.vkryl.core.StringUtils;
 import me.vkryl.core.collection.IntList;
+import me.vkryl.core.lambda.CancellableRunnable;
 import me.vkryl.core.lambda.Destroyable;
 import me.vkryl.core.lambda.RunnableData;
 import tgx.td.ChatId;
@@ -966,11 +973,7 @@ public class MediaViewController extends ViewController<MediaViewController.Args
             c.hideSoftwareKeyboard();
           }
         }
-        if (isFullscreen) {
-          context().addFullScreenView(this, true);
-        } else {
-          context().removeFullScreenView(this, true);
-        }
+        // 用户偏好:媒体查看器(含视频播放)期间保持系统状态栏可见,不申请 FLAG_FULLSCREEN
       }
     }
   }
@@ -2050,6 +2053,11 @@ public class MediaViewController extends ViewController<MediaViewController.Args
   }
 
   private void onMediaStackChanged (boolean itemCountChanged) {
+    MediaItem current = stack.getCurrent();
+    if (gestureItem != current) {
+      gestureItem = current;
+      resetVideoGestureState();
+    }
     switch (mode) {
       case MODE_MESSAGES:
       case MODE_SIMPLE: {
@@ -2628,6 +2636,43 @@ public class MediaViewController extends ViewController<MediaViewController.Args
   }
 
   private boolean isPlayingVideo;
+
+  private @Nullable VideoGestureOverlayView videoGestureOverlay;
+  private MediaItem gestureItem;
+  private boolean currentCanSeek;
+  private boolean speedBoostActive;
+  private boolean videoSeekGestureActive;
+  private long videoSeekGestureStartMs, videoSeekGestureTargetMs;
+  private long pendingDoubleTapSeekMs = -1;
+  private long doubleTapSeekOriginMs;
+  private CancellableRunnable doubleTapSeekResetRunnable;
+
+  private @Nullable ExecutorService seekPreviewExecutor;
+  private int seekPreviewGeneration;
+  private long seekPreviewLastRequestMs;
+  private boolean sliderSeekPreviewActive;
+  private @Nullable TdApi.File seekPreviewDownloadFile;
+  private @Nullable FileUpdateListener seekPreviewFileListener;
+  private long seekPreviewLastDownloadMs;
+  private long seekPreviewWindowOffset = -1;
+  private long seekPreviewWindowLimit;
+  private long seekPreviewPendingOffset;
+  private long seekPreviewReadyOffset = -1;
+  private long seekPreviewReadySize;
+  private int seekPreviewBackIndex;
+  private long seekPreviewLastMoveMs;
+  private boolean seekPreviewTickScheduled;
+  private long seekPreviewLastTargetMs;
+  private long seekPreviewDecodedTargetMs = -1;
+  private Mp4Keyframes seekKeyframes;
+  private int seekKeyframesFileId = -1;
+  private int seekKeyframeState;
+  private long seekMoovRangeOffset = -1;
+  private long seekMoovRangeEnd = -1;
+  private final android.util.SparseArray<Bitmap> seekKfThumbs = new android.util.SparseArray<>();
+  private static final int SEEK_KF_THUMB_LIMIT = 60;
+  private long seekKfProbeLastMs;
+  private long seekPreviewLastProbeMs;
 
   private void updatePipState (boolean isPlaying) {
     if (pipPlayPauseButton != null) {
@@ -3328,7 +3373,7 @@ public class MediaViewController extends ViewController<MediaViewController.Args
           videoSliderView.resetDuration(timeTotal, timeNow, isLoaded, animated);
         }
         MediaItem item = stack.getCurrent();
-        videoSliderView.updateSecondarySeek(TD.getFileOffsetProgress(item.getTargetFile()), TD.getFilePrefixProgress(item.getTargetFile()));
+        refreshCachedSegments(true);
         videoSliderView.setFile(item.getSourceGalleryFile());
         videoSliderView.setShowPlayPause(item.isVideoOrGif(), animated);
         videoSliderView.setIsPlaying(false, true);
@@ -3337,6 +3382,9 @@ public class MediaViewController extends ViewController<MediaViewController.Args
           videoSliderView.setIsPlaying(true, animated);
           updatePipState(true);
         }
+      }
+      if (isVisible) {
+        scheduleCachedSegmentsRefresh();
       }
     }
   }
@@ -3424,13 +3472,19 @@ public class MediaViewController extends ViewController<MediaViewController.Args
 
   @Override
   public void onCanSeekChanged (MediaItem item, boolean canSeek) {
-    if (stack.getCurrent() == item && videoSliderView != null) {
-      videoSliderView.setSlideEnabled(canSeek);
+    if (stack.getCurrent() == item) {
+      currentCanSeek = canSeek;
+      if (videoSliderView != null) {
+        videoSliderView.setSlideEnabled(canSeek);
+      }
     }
   }
 
   @Override
   public void onSeekProgress (MediaItem item, long nowMs, long durationMs, float progress) {
+    if (videoSeekGestureActive) {
+      return;
+    }
     if (stack.getCurrent() == item && videoSliderView != null) {
       videoSliderView.updateSeek(nowMs, durationMs, progress);
     }
@@ -3439,7 +3493,7 @@ public class MediaViewController extends ViewController<MediaViewController.Args
   @Override
   public void onSeekSecondaryProgress (MediaItem item, float offset, float progress) {
     if (stack.getCurrent() == item && videoSliderView != null) {
-      videoSliderView.updateSecondarySeek(offset, progress);
+      refreshCachedSegments(false);
     }
   }
 
@@ -3461,6 +3515,792 @@ public class MediaViewController extends ViewController<MediaViewController.Args
         }
         break;
       }
+    }
+  }
+
+  public boolean allowVideoGestures () {
+    return mode != MODE_GALLERY && mode != MODE_SECRET;
+  }
+
+  private VideoGestureOverlayView gestureOverlay () {
+    if (videoGestureOverlay == null) {
+      videoGestureOverlay = new VideoGestureOverlayView(context);
+      videoGestureOverlay.setLayoutParams(FrameLayoutFix.newParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+      // mediaView 在 MODE_MESSAGES 下有 elevation（PiP 阴影），dismiss 动画还会叠加 translationZ，HUD 必须高于其最大 Z 值才不会被视频盖住
+      videoGestureOverlay.setElevation(Screen.dp(6f));
+      contentView.addView(videoGestureOverlay, contentView.indexOfChild(mediaView) + 1);
+    }
+    return videoGestureOverlay;
+  }
+
+  private void resetVideoGestureState () {
+    speedBoostActive = false;
+    videoSeekGestureActive = false;
+    sliderSeekPreviewActive = false;
+    pendingDoubleTapSeekMs = -1;
+    clearSeekPreview();
+    if (doubleTapSeekResetRunnable != null) {
+      doubleTapSeekResetRunnable.cancel();
+      doubleTapSeekResetRunnable = null;
+    }
+    if (videoGestureOverlay != null) {
+      videoGestureOverlay.hide();
+    }
+  }
+
+  @Override
+  public void onVideoDoubleTap (MediaItem item, float x, float y) {
+    if (stack.getCurrent() != item) {
+      return;
+    }
+    MediaCellView cell = mediaView.findCellForItem(item);
+    if (cell == null) {
+      return;
+    }
+    final float width = mediaView.getMeasuredWidth();
+    if (x < width * .35f) {
+      doubleTapSeek(cell, -10_000);
+    } else if (x > width * .65f) {
+      doubleTapSeek(cell, 10_000);
+    } else {
+      cell.playPauseVideo();
+      gestureOverlay().showPlayPause(cell.isVideoPlaying());
+    }
+  }
+
+  private void doubleTapSeek (MediaCellView cell, long deltaMs) {
+    if (!currentCanSeek) {
+      return;
+    }
+    final long duration = cell.getVideoDurationMs();
+    if (duration <= 0) {
+      return;
+    }
+    final long base = pendingDoubleTapSeekMs >= 0 ? pendingDoubleTapSeekMs : cell.getVideoPositionMs();
+    if (pendingDoubleTapSeekMs < 0) {
+      doubleTapSeekOriginMs = base;
+    }
+    final long target = Math.max(0, Math.min(duration, base + deltaMs));
+    pendingDoubleTapSeekMs = target;
+    cell.seekVideoToMs(target);
+    gestureOverlay().showSeekStep(deltaMs > 0, Math.abs(target - doubleTapSeekOriginMs));
+    if (doubleTapSeekResetRunnable != null) {
+      doubleTapSeekResetRunnable.cancel();
+    }
+    UI.post(doubleTapSeekResetRunnable = new CancellableRunnable() {
+      @Override
+      public void act () {
+        doubleTapSeekResetRunnable = null;
+        pendingDoubleTapSeekMs = -1;
+      }
+    }, 800);
+  }
+
+  @Override
+  public void onVideoLongPress (MediaItem item, boolean started) {
+    if (stack.getCurrent() != item) {
+      return;
+    }
+    MediaCellView cell = mediaView.findCellForItem(item);
+    if (cell == null) {
+      return;
+    }
+    if (started) {
+      if (cell.isVideoPlaying()) {
+        speedBoostActive = true;
+        cell.setVideoSpeed(3f);
+        gestureOverlay().showSpeedBoost();
+      }
+    } else if (speedBoostActive) {
+      speedBoostActive = false;
+      cell.setVideoSpeed(1f);
+      gestureOverlay().hide();
+    }
+  }
+
+  @Override
+  public void onVideoSeekStart (MediaItem item) {
+    if (stack.getCurrent() != item || !currentCanSeek) {
+      return;
+    }
+    MediaCellView cell = mediaView.findCellForItem(item);
+    if (cell == null || cell.getVideoDurationMs() <= 0) {
+      return;
+    }
+    videoSeekGestureActive = true;
+    videoSeekGestureStartMs = cell.getVideoPositionMs();
+    videoSeekGestureTargetMs = videoSeekGestureStartMs;
+    mediaView.pauseIfPlaying();
+    gestureOverlay().showSeekPreview(videoSeekGestureStartMs, cell.getVideoDurationMs());
+    requestSeekPreviewFrame(videoSeekGestureTargetMs);
+    requestSeekPreviewDownload(videoSeekGestureTargetMs, cell.getVideoDurationMs(), true, true);
+  }
+
+  @Override
+  public void onVideoSeekMove (MediaItem item, float dx) {
+    if (!videoSeekGestureActive || stack.getCurrent() != item) {
+      return;
+    }
+    MediaCellView cell = mediaView.findCellForItem(item);
+    if (cell == null) {
+      return;
+    }
+    final long duration = cell.getVideoDurationMs();
+    final float width = mediaView.getMeasuredWidth();
+    if (duration <= 0 || width <= 0) {
+      return;
+    }
+    videoSeekGestureTargetMs = Math.max(0, Math.min(duration, videoSeekGestureStartMs + (long) (dx / width * duration)));
+    gestureOverlay().showSeekPreview(videoSeekGestureTargetMs, duration);
+    updateSeekSlider(videoSeekGestureTargetMs, duration);
+    requestSeekPreviewFrame(videoSeekGestureTargetMs);
+    requestSeekPreviewDownload(videoSeekGestureTargetMs, duration, false, true);
+  }
+
+  @Override
+  public void onVideoSeekEnd (MediaItem item, boolean commit) {
+    if (!videoSeekGestureActive) {
+      return;
+    }
+    videoSeekGestureActive = false;
+    clearSeekPreview();
+    refreshCachedSegments(true);
+    if (stack.getCurrent() == item) {
+      MediaCellView cell = mediaView.findCellForItem(item);
+      if (cell != null) {
+        if (commit) {
+          cell.seekVideoToMs(videoSeekGestureTargetMs);
+          updateSeekSlider(videoSeekGestureTargetMs, cell.getVideoDurationMs());
+          mediaView.resumeIfNeeded(videoSeekGestureTargetMs / (float) cell.getVideoDurationMs());
+        } else {
+          updateSeekSlider(cell.getVideoPositionMs(), cell.getVideoDurationMs());
+          mediaView.resumeIfNeeded(cell.getVideoPositionMs() / (float) cell.getVideoDurationMs());
+        }
+      }
+    }
+    gestureOverlay().hide();
+  }
+
+  @Override
+  public void onVideoPageStart (MediaItem item) {
+    if (stack.getCurrent() == item) {
+      mediaView.pauseIfPlaying();
+      mediaView.startVideoPage();
+    }
+  }
+
+  @Override
+  public void onVideoPageMove (MediaItem item, float dy) {
+    if (stack.getCurrent() == item) {
+      mediaView.moveVideoPage(dy);
+    }
+  }
+
+  @Override
+  public void onVideoPageEnd (MediaItem item, float dy, float velocityY) {
+    if (stack.getCurrent() == item) {
+      mediaView.endVideoPage(dy, velocityY, true);
+    }
+  }
+
+  @Override
+  public void onVideoPageCancel (MediaItem item) {
+    if (stack.getCurrent() == item) {
+      mediaView.cancelVideoPage();
+    }
+  }
+
+  private void updateSeekSlider (long nowMs, long durationMs) {
+    if (videoSliderView != null && durationMs > 0) {
+      videoSliderView.updateSeek(nowMs, durationMs, nowMs / (float) durationMs);
+    }
+  }
+
+  private void startSliderSeekPreview () {
+    MediaItem item = stack.getCurrent();
+    MediaCellView cell = item != null ? mediaView.findCellForItem(item) : null;
+    if (cell == null || cell.getVideoDurationMs() <= 0) {
+      return;
+    }
+    sliderSeekPreviewActive = true;
+    long nowMs = cell.getVideoPositionMs();
+    gestureOverlay().showSeekPreview(nowMs, cell.getVideoDurationMs());
+    requestSeekPreviewFrame(nowMs);
+    requestSeekPreviewDownload(nowMs, cell.getVideoDurationMs(), true, true);
+  }
+
+  private void updateSliderSeekPreview (float factor) {
+    MediaItem item = stack.getCurrent();
+    MediaCellView cell = item != null ? mediaView.findCellForItem(item) : null;
+    if (cell == null) {
+      return;
+    }
+    long duration = cell.getVideoDurationMs();
+    long targetMs = Math.max(0, Math.min(duration, (long) (factor * duration)));
+    gestureOverlay().showSeekPreview(targetMs, duration);
+    if (videoSliderView != null) {
+      videoSliderView.updateSeekTime(targetMs);
+    }
+    requestSeekPreviewFrame(targetMs);
+    requestSeekPreviewDownload(targetMs, duration, false, true);
+  }
+
+  private void endSliderSeekPreview () {
+    if (!sliderSeekPreviewActive) {
+      return;
+    }
+    sliderSeekPreviewActive = false;
+    clearSeekPreview();
+    refreshCachedSegments(true);
+    gestureOverlay().hide();
+  }
+
+  private static final long[] SEEK_PREVIEW_BACK_SIZES = {64 * 1024, 256 * 1024, 512 * 1024, 1024 * 1024, 2 * 1024 * 1024};
+  private static final long SEEK_PREVIEW_READY_SIZE = 32 * 1024;
+
+  private void requestSeekPreviewDownload (long targetMs, long durationMs, boolean start, boolean markMove) {
+    MediaItem item = stack.getCurrent();
+    if (item == null || item.getType() != MediaItem.TYPE_VIDEO) {
+      return;
+    }
+    TdApi.File file = item.getTargetFile();
+    if (file == null || file.size <= 0 || TD.isFileLoaded(file)) {
+      return;
+    }
+    long offset = durationMs > 0 ? Math.max(0, Math.min(file.size - 1, (long) ((double) targetMs / durationMs * file.size))) : 0;
+    long now = SystemClock.elapsedRealtime();
+    if (start) {
+      resetSeekKeyframeState(file.id);
+      cancelSeekPreviewDownload();
+      seekPreviewDownloadFile = file;
+      seekPreviewWindowOffset = -1;
+      seekPreviewReadyOffset = -1;
+      seekPreviewReadySize = 0;
+      seekPreviewBackIndex = 0;
+      seekPreviewFileListener = updateFile -> UI.post(() -> onSeekPreviewFileUpdate(updateFile));
+      tdlib.listeners().addFileListener(file.id, seekPreviewFileListener);
+    } else if (seekPreviewDownloadFile == null || seekPreviewDownloadFile.id != file.id) {
+      return;
+    } else {
+      if (markMove) {
+        seekPreviewLastMoveMs = now;
+        cancelSeekPreviewTransfer();
+      }
+    }
+    if (seekKeyframeState == 2) {
+      int kfIndex = seekKeyframes != null ? seekKeyframes.indexForTime(targetMs) : -1;
+      Bitmap cached = kfIndex >= 0 ? seekKfThumbs.get(kfIndex) : null;
+      if (cached != null) {
+        showSeekThumb(cached);
+        return;
+      }
+    }
+    if (seekKeyframeState == 0) {
+      ensureSeekKeyframes(file);
+    }
+    seekPreviewPendingOffset = offset;
+    if (seekPreviewWindowOffset >= 0 && offset >= seekPreviewWindowOffset && offset < seekPreviewWindowOffset + seekPreviewWindowLimit) {
+      probeSeekPreview(file);
+      return;
+    }
+    if (seekPreviewReadySize > 0 && offset >= seekPreviewReadyOffset && offset < seekPreviewReadyOffset + seekPreviewReadySize) {
+      return;
+    }
+    if (!start && now - seekPreviewLastDownloadMs < 400) {
+      return;
+    }
+    seekPreviewBackIndex = 0;
+    issueSeekPreviewWindow(file, offset);
+    probeSeekPreview(file);
+  }
+
+  private void issueSeekPreviewWindow (TdApi.File file, long targetOffset) {
+    seekPreviewLastDownloadMs = SystemClock.elapsedRealtime();
+    long back = SEEK_PREVIEW_BACK_SIZES[seekPreviewBackIndex];
+    long offset = Math.max(0, targetOffset - back);
+    long limit = Math.min(file.size - offset, back + 64 * 1024);
+    seekPreviewWindowOffset = offset;
+    seekPreviewWindowLimit = limit;
+    seekPreviewReadySize = 0;
+    tdlib.send(new TdApi.DownloadFile(file.id, 32, offset, limit, false), (result, error) -> { });
+    scheduleSeekPreviewProbe();
+  }
+
+  private void scheduleSeekPreviewProbe () {
+    if (seekPreviewTickScheduled) {
+      return;
+    }
+    seekPreviewTickScheduled = true;
+    UI.post(() -> {
+      seekPreviewTickScheduled = false;
+      TdApi.File file = seekPreviewDownloadFile;
+      if (file == null || !(videoSeekGestureActive || sliderSeekPreviewActive)) {
+        return;
+      }
+      MediaItem item = stack.getCurrent();
+      MediaCellView cell = item != null ? mediaView.findCellForItem(item) : null;
+      if (cell != null && cell.getVideoDurationMs() > 0) {
+        requestSeekPreviewDownload(seekPreviewLastTargetMs, cell.getVideoDurationMs(), false, false);
+      }
+      if (seekPreviewWindowOffset >= 0 && seekPreviewReadySize == 0) {
+        probeSeekPreview(file);
+      }
+      scheduleSeekPreviewProbe();
+    }, 300);
+  }
+
+  private void probeSeekPreview (TdApi.File file) {
+    if (seekPreviewWindowOffset < 0 || seekPreviewPendingOffset < seekPreviewWindowOffset || seekPreviewPendingOffset >= seekPreviewWindowOffset + seekPreviewWindowLimit) {
+      return;
+    }
+    long now = SystemClock.elapsedRealtime();
+    if (now - seekPreviewLastProbeMs < 250) {
+      return;
+    }
+    seekPreviewLastProbeMs = now;
+    final long offset = seekPreviewWindowOffset;
+    final long needed = Math.min(seekPreviewWindowLimit, Math.max(SEEK_PREVIEW_READY_SIZE, seekPreviewPendingOffset - offset + SEEK_PREVIEW_READY_SIZE));
+    final int generation = seekPreviewGeneration;
+    tdlib.send(new TdApi.GetFileDownloadedPrefixSize(file.id, offset), (result, error) -> {
+      if (error != null || generation != seekPreviewGeneration || seekPreviewDownloadFile == null) {
+        return;
+      }
+      if (result.size >= needed) {
+        seekPreviewReadyOffset = offset;
+        seekPreviewReadySize = result.size;
+        seekPreviewLastRequestMs = 0;
+        if (seekPreviewLastTargetMs != seekPreviewDecodedTargetMs) {
+          UI.post(() -> requestSeekPreviewFrame(seekPreviewLastTargetMs));
+        }
+      }
+    });
+  }
+
+  private void onSeekPreviewFileUpdate (TdApi.UpdateFile updateFile) {
+    TdApi.File file = seekPreviewDownloadFile;
+    if (file == null || updateFile.file.id != file.id) {
+      return;
+    }
+    Td.copyTo(updateFile.file, file);
+    if (seekKeyframeState == 1 && seekMoovRangeOffset >= 0) {
+      probeSeekRange(file.id, seekMoovRangeOffset, seekMoovRangeEnd - seekMoovRangeOffset);
+      refreshCachedSegments(false);
+      return;
+    }
+    if (seekPreviewWindowOffset >= 0 && seekPreviewReadySize == 0) {
+      probeSeekPreview(file);
+    }
+    refreshCachedSegments(false);
+  }
+
+  private void expandSeekPreviewWindow (int generation) {
+    if (generation != seekPreviewGeneration || !(videoSeekGestureActive || sliderSeekPreviewActive)) {
+      return;
+    }
+    TdApi.File file = seekPreviewDownloadFile;
+    if (file == null) {
+      return;
+    }
+    if (SystemClock.elapsedRealtime() - seekPreviewLastMoveMs < 300) {
+      UI.post(() -> expandSeekPreviewWindow(generation), 300);
+      return;
+    }
+    if (seekPreviewBackIndex + 1 >= SEEK_PREVIEW_BACK_SIZES.length) {
+      return;
+    }
+    seekPreviewBackIndex++;
+    issueSeekPreviewWindow(file, seekPreviewPendingOffset);
+  }
+
+  private void cancelSeekPreviewTransfer () {
+    TdApi.File file = seekPreviewDownloadFile;
+    if (file != null && seekPreviewWindowOffset >= 0) {
+      tdlib.send(new TdApi.CancelDownloadFile(file.id, false), tdlib.typedOkHandler());
+    }
+    seekPreviewWindowOffset = -1;
+    seekPreviewWindowLimit = 0;
+    seekPreviewReadyOffset = -1;
+    seekPreviewReadySize = 0;
+    seekPreviewBackIndex = 0;
+  }
+
+  private void cancelSeekPreviewDownload () {
+    if (seekPreviewDownloadFile != null) {
+      if (seekPreviewFileListener != null) {
+        tdlib.listeners().removeFileListener(seekPreviewDownloadFile.id, seekPreviewFileListener);
+      }
+      tdlib.send(new TdApi.CancelDownloadFile(seekPreviewDownloadFile.id, false), tdlib.typedOkHandler());
+    }
+    seekPreviewDownloadFile = null;
+    seekPreviewFileListener = null;
+    seekPreviewLastDownloadMs = 0;
+    seekPreviewWindowOffset = -1;
+    seekPreviewWindowLimit = 0;
+    seekPreviewReadyOffset = -1;
+    seekPreviewReadySize = 0;
+    seekPreviewBackIndex = 0;
+    seekPreviewTickScheduled = false;
+    seekPreviewDecodedTargetMs = -1;
+    if (seekKeyframeState == 1) {
+      seekKeyframeState = 0;
+    }
+    seekMoovRangeOffset = -1;
+    seekMoovRangeEnd = -1;
+  }
+
+  private void resetSeekKeyframeState (int fileId) {
+    if (seekKeyframesFileId == fileId && seekKeyframeState != 0) {
+      return;
+    }
+    seekKeyframes = null;
+    seekKeyframesFileId = fileId;
+    seekKeyframeState = 0;
+    seekMoovRangeOffset = -1;
+    seekMoovRangeEnd = -1;
+    seekKfThumbs.clear();
+  }
+
+  private void ensureSeekKeyframes (TdApi.File file) {
+    if (seekKeyframeState != 0) {
+      return;
+    }
+    final String path = file.local != null ? file.local.path : null;
+    if (StringUtils.isEmpty(path) || file.size <= 0) {
+      seekKeyframeState = -1;
+      return;
+    }
+    seekKeyframeState = 1;
+    parseSeekKeyframes(file.id, path, file.size);
+  }
+
+  private void parseSeekKeyframes (int fileId, String path, long fileSize) {
+    if (seekPreviewExecutor == null) {
+      seekPreviewExecutor = Executors.newSingleThreadExecutor();
+    }
+    seekPreviewExecutor.execute(() -> {
+      Mp4Keyframes parsed = null;
+      Mp4Keyframes.HoleException hole = null;
+      try (RandomAccessFile raf = new RandomAccessFile(path, "r")) {
+        parsed = Mp4Keyframes.parse(raf, fileSize);
+      } catch (Mp4Keyframes.HoleException e) {
+        hole = e;
+      } catch (Throwable ignored) {
+      }
+      final Mp4Keyframes result = parsed;
+      final Mp4Keyframes.HoleException holeError = hole;
+      UI.post(() -> {
+        if (seekKeyframesFileId != fileId || seekKeyframeState != 1) {
+          return;
+        }
+        if (result != null) {
+          seekKeyframes = result;
+          seekKeyframeState = 2;
+          tdlib.send(new TdApi.CancelDownloadFile(fileId, false), tdlib.typedOkHandler());
+        } else if (holeError != null && seekPreviewDownloadFile != null && seekPreviewDownloadFile.id == fileId) {
+          seekMoovRangeOffset = holeError.offset;
+          seekMoovRangeEnd = Math.min(fileSize, holeError.offset + Math.max(holeError.length, 256 * 1024));
+          tdlib.send(new TdApi.DownloadFile(fileId, 32, seekMoovRangeOffset, seekMoovRangeEnd - seekMoovRangeOffset, false), (r, er) -> { });
+          probeSeekRange(fileId, seekMoovRangeOffset, seekMoovRangeEnd - seekMoovRangeOffset);
+        } else {
+          seekKeyframeState = -1;
+        }
+      });
+    });
+  }
+
+  private void probeSeekRange (int fileId, long offset, long needed) {
+    TdApi.File file = seekPreviewDownloadFile;
+    if (file == null || file.id != fileId || offset < 0) {
+      return;
+    }
+    long now = SystemClock.elapsedRealtime();
+    if (now - seekKfProbeLastMs < 200) {
+      return;
+    }
+    seekKfProbeLastMs = now;
+    final int generation = seekPreviewGeneration;
+    tdlib.send(new TdApi.GetFileDownloadedPrefixSize(fileId, offset), (result, error) -> {
+      if (error != null || generation != seekPreviewGeneration || seekPreviewDownloadFile == null || seekPreviewDownloadFile.id != fileId) {
+        return;
+      }
+      if (result.size >= needed) {
+        if (seekKeyframeState == 1 && seekMoovRangeOffset == offset) {
+          seekMoovRangeOffset = -1;
+          seekMoovRangeEnd = -1;
+          parseSeekKeyframes(fileId, file.local.path, file.size);
+        }
+      }
+    });
+  }
+
+
+  private void cacheSeekThumb (long targetMs, Bitmap bitmap) {
+    if (seekKeyframes == null || seekKeyframeState != 2 || bitmap == null || bitmap.isRecycled()) {
+      return;
+    }
+    int kfIndex = seekKeyframes.indexForTime(targetMs);
+    if (kfIndex < 0 || seekKfThumbs.get(kfIndex) != null) {
+      return;
+    }
+    float scale = Math.min(1f, 480f / (float) bitmap.getHeight());
+    Bitmap scaled = scale < 1f ? Bitmap.createScaledBitmap(bitmap, Math.max(1, Math.round(bitmap.getWidth() * scale)), Math.max(1, Math.round(bitmap.getHeight() * scale)), true) : bitmap;
+    Bitmap reduced = Bitmap.createBitmap(scaled.getWidth(), scaled.getHeight(), Bitmap.Config.RGB_565);
+    new android.graphics.Canvas(reduced).drawBitmap(scaled, 0f, 0f, null);
+    if (reduced != scaled) {
+      scaled.recycle();
+    }
+    seekKfThumbs.put(kfIndex, reduced);
+    while (seekKfThumbs.size() > SEEK_KF_THUMB_LIMIT) {
+      int cur = seekKeyframes.indexForTime(seekPreviewLastTargetMs);
+      int worst = -1, worstDist = -1;
+      for (int i = 0; i < seekKfThumbs.size(); i++) {
+        int key = seekKfThumbs.keyAt(i);
+        int dist = cur >= 0 ? Math.abs(key - cur) : Integer.MAX_VALUE;
+        if (dist > worstDist && key != kfIndex) {
+          worstDist = dist;
+          worst = key;
+        }
+      }
+      if (worst == -1) {
+        break;
+      }
+      seekKfThumbs.remove(worst);
+    }
+  }
+
+  private void showSeekThumb (Bitmap thumb) {
+    final int generation = seekPreviewGeneration;
+    UI.post(() -> {
+      if (generation == seekPreviewGeneration && (videoSeekGestureActive || sliderSeekPreviewActive)) {
+        gestureOverlay().setPreviewBitmap(thumb);
+      }
+    });
+  }
+
+  private static final int CACHED_SEGMENT_COUNT = 256;
+  private long lastCachedSegmentsRefreshMs;
+  private boolean cachedSegmentsProbePending;
+  private boolean cachedSegmentsLoopScheduled;
+  private boolean uiLoopStopped;
+
+  private void scheduleCachedSegmentsRefresh () {
+    if (cachedSegmentsLoopScheduled || uiLoopStopped) {
+      return;
+    }
+    cachedSegmentsLoopScheduled = true;
+    UI.post(() -> {
+      cachedSegmentsLoopScheduled = false;
+      if (uiLoopStopped) {
+        return;
+      }
+      MediaItem item = stack.getCurrent();
+      boolean isVideo = item != null && item.getType() == MediaItem.TYPE_VIDEO && videoSliderView != null;
+      if (isVideo) {
+        refreshCachedSegments(false);
+        updateBufferingSpeed(item, mediaView.findCellForItem(item));
+      }
+      scheduleCachedSegmentsRefresh();
+    }, 2000);
+  }
+
+  private long speedFileId = -1;
+  private long speedLastBytes, speedLastMs;
+
+  private void updateBufferingSpeed (MediaItem item, MediaCellView cell) {
+    if (cell == null || !cell.isVideoBuffering()) {
+      if (cell != null) {
+        cell.setDownloadSpeedText(null);
+      }
+      speedFileId = -1;
+      return;
+    }
+    TdApi.File file = item.getTargetFile();
+    if (file == null || file.size <= 0) {
+      return;
+    }
+    TdApi.File fresh = tdlib.clientExecuteT(new TdApi.GetFile(file.id), 500L, false);
+    if (fresh == null) {
+      return;
+    }
+    long end = fresh.local.downloadedSize;
+    long now = SystemClock.elapsedRealtime();
+    if (speedFileId != file.id) {
+      speedFileId = file.id;
+      speedLastBytes = end;
+      speedLastMs = now;
+      return;
+    }
+    long dt = now - speedLastMs;
+    if (dt < 1000) {
+      return;
+    }
+    long bytes = end - speedLastBytes;
+    speedLastBytes = end;
+    speedLastMs = now;
+    cell.setDownloadSpeedText(bytes >= 0 ? Strings.buildSize(bytes * 1000 / dt) + "/s" : null);
+  }
+
+  private void refreshCachedSegments (boolean force) {
+    if (videoSliderView == null) {
+      return;
+    }    MediaItem item = stack.getCurrent();
+    TdApi.File file = item != null && item.getType() == MediaItem.TYPE_VIDEO ? item.getTargetFile() : null;
+    if (file == null || file.size <= 0) {
+      videoSliderView.updateCachedSegments(null);
+      return;
+    }
+    if (TD.isFileLoaded(file)) {
+      videoSliderView.updateCachedSegments(new float[]{0f, 1f});
+      return;
+    }
+    long now = SystemClock.elapsedRealtime();
+    if (cachedSegmentsProbePending || (!force && now - lastCachedSegmentsRefreshMs < 1000)) {
+      return;
+    }
+    lastCachedSegmentsRefreshMs = now;
+    cachedSegmentsProbePending = true;
+    final int fileId = file.id;
+    final long fileSize = file.size;
+    final long segmentSize = Math.max(1, fileSize / CACHED_SEGMENT_COUNT);
+    final long[] counts = new long[CACHED_SEGMENT_COUNT];
+    final AtomicInteger remaining = new AtomicInteger(CACHED_SEGMENT_COUNT);
+    for (int i = 0; i < CACHED_SEGMENT_COUNT; i++) {
+      final int index = i;
+      tdlib.send(new TdApi.GetFileDownloadedPrefixSize(fileId, i * segmentSize), (result, error) -> {
+        counts[index] = error == null ? result.size : 0;
+        if (remaining.decrementAndGet() == 0) {
+          cachedSegmentsProbePending = false;
+          UI.post(() -> applyCachedSegments(fileId, fileSize, segmentSize, counts));
+        }
+      });
+    }
+  }
+
+  private void applyCachedSegments (int fileId, long fileSize, long segmentSize, long[] counts) {
+    MediaItem item = stack.getCurrent();
+    TdApi.File file = item != null ? item.getTargetFile() : null;
+    if (file == null || file.id != fileId || videoSliderView == null) {
+      return;
+    }
+    ArrayList<Float> segments = new ArrayList<>();
+    for (int i = 0; i < CACHED_SEGMENT_COUNT; i++) {
+      if (counts[i] <= 0) {
+        continue;
+      }
+      float cachedFraction = Math.min(1f, counts[i] / (float) segmentSize);
+      segments.add(i / (float) CACHED_SEGMENT_COUNT);
+      segments.add((i + cachedFraction) / (float) CACHED_SEGMENT_COUNT);
+    }
+    if (segments.isEmpty()) {
+      videoSliderView.updateCachedSegments(null);
+      return;
+    }
+    float[] result = new float[segments.size()];
+    for (int i = 0; i < result.length; i++) {
+      result[i] = segments.get(i);
+    }
+    videoSliderView.updateCachedSegments(result);
+  }
+
+  private boolean isSeekPreviewReady (MediaItem item, long targetMs) {
+    TdApi.File file = item.getTargetFile();
+    if (file == null || TD.isFileLoaded(file)) {
+      return true;
+    }
+    if (seekPreviewReadySize <= 0 || file.size <= 0) {
+      return false;
+    }
+    MediaCellView cell = mediaView.findCellForItem(item);
+    long duration = cell != null ? cell.getVideoDurationMs() : 0;
+    if (duration <= 0) {
+      return false;
+    }
+    long offset = (long) ((double) targetMs / duration * file.size);
+    long margin = Math.min(SEEK_PREVIEW_READY_SIZE, file.size - offset);
+    return offset >= seekPreviewReadyOffset && offset + margin <= seekPreviewReadyOffset + seekPreviewReadySize;
+  }
+
+  private void requestSeekPreviewFrame (long targetMs) {
+    long now = SystemClock.elapsedRealtime();
+    if (now - seekPreviewLastRequestMs < 150) {
+      return;
+    }
+    seekPreviewLastRequestMs = now;
+    seekPreviewLastTargetMs = targetMs;
+    MediaItem item = stack.getCurrent();
+    String path = null;
+    boolean ready = true;
+    if (item != null) {
+      if (item.getType() == MediaItem.TYPE_GALLERY_VIDEO) {
+        ImageGalleryFile file = item.getSourceGalleryFile();
+        path = file != null ? file.getFilePath() : null;
+      } else {
+        TdApi.File file = item.getTargetFile();
+        path = file != null && file.local != null ? file.local.path : null;
+        ready = isSeekPreviewReady(item, targetMs);
+      }
+    }
+    if (StringUtils.isEmpty(path) || !ready) {
+      return;
+    }
+    final int generation = seekPreviewGeneration;
+    final String filePath = path;
+    if (seekPreviewExecutor == null) {
+      seekPreviewExecutor = Executors.newSingleThreadExecutor();
+    }
+    seekPreviewExecutor.execute(() -> {
+      Bitmap bitmap = null;
+      MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+      try {
+        retriever.setDataSource(filePath);
+        Bitmap frame = retriever.getFrameAtTime(targetMs * 1000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
+        if (frame == null) {
+          frame = retriever.getFrameAtTime(targetMs * 1000, MediaMetadataRetriever.OPTION_CLOSEST);
+        }
+        if (frame != null) {
+          bitmap = scaleSeekPreviewFrame(frame);
+          if (bitmap != frame) {
+            frame.recycle();
+          }
+        }
+      } catch (Exception ignored) {
+      } finally {
+        try {
+          retriever.release();
+        } catch (Exception ignored) {
+        }
+      }
+      final Bitmap result = bitmap;
+      if (result != null) {
+        seekPreviewDecodedTargetMs = targetMs;
+        UI.post(() -> {
+          if (generation == seekPreviewGeneration && (videoSeekGestureActive || sliderSeekPreviewActive)) {
+            gestureOverlay().setPreviewBitmap(result);
+          }
+          cacheSeekThumb(targetMs, result);
+        });
+      } else {
+        UI.post(() -> expandSeekPreviewWindow(generation));
+      }
+    });
+  }
+
+  private Bitmap scaleSeekPreviewFrame (Bitmap frame) {
+    float scale = Math.min(1f, 480f / (float) frame.getHeight());
+    if (scale >= 1f) {
+      return frame;
+    }
+    int width = Math.max(1, Math.round(frame.getWidth() * scale));
+    int height = Math.max(1, Math.round(frame.getHeight() * scale));
+    return Bitmap.createScaledBitmap(frame, width, height, true);
+  }
+
+  private void clearSeekPreview () {
+    seekPreviewGeneration++;
+    seekPreviewLastRequestMs = 0;
+    cancelSeekPreviewDownload();
+    if (videoGestureOverlay != null) {
+      videoGestureOverlay.setPreviewBitmap(null);
     }
   }
 
@@ -5039,7 +5879,12 @@ public class MediaViewController extends ViewController<MediaViewController.Args
             if (listenCloseBySlide) {
               float x = e.getX();
               float y = e.getY();
-              if (Math.abs(startY - y) >= Screen.getTouchSlopBig() && Math.abs(startX - x) < Screen.getTouchSlop() * 1.65f) {
+              if (mediaView.isVideoGestureMode()) {
+                // 视频上的竖滑让给视频翻页手势，不再作为下滑关闭手势
+                if (Math.abs(startY - y) >= Screen.getTouchSlopBig() || Math.abs(startX - x) >= Screen.getTouchSlopY()) {
+                  listenCloseBySlide = false;
+                }
+              } else if (Math.abs(startY - y) >= Screen.getTouchSlopBig() && Math.abs(startX - x) < Screen.getTouchSlop() * 1.65f) {
                 mediaView.dropPreview(MediaView.DIRECTION_AUTO, 0f);
                 listenCloseBySlide = false;
                 slideStartX = x;
@@ -5495,6 +6340,11 @@ public class MediaViewController extends ViewController<MediaViewController.Args
   @Override
   public void destroy () {
     super.destroy();
+    uiLoopStopped = true;
+    if (seekPreviewExecutor != null) {
+      seekPreviewExecutor.shutdown();
+      seekPreviewExecutor = null;
+    }
     MediaItem current = stack.getCurrent();
     if (current != null && current.isViewOnce()) {
       current.viewContent(true);
@@ -5544,14 +6394,18 @@ public class MediaViewController extends ViewController<MediaViewController.Args
   public void onSetStateChanged (SliderView view, boolean isSetting) {
     if (isSetting) {
       mediaView.pauseIfPlaying();
+      startSliderSeekPreview();
     } else {
+      endSliderSeekPreview();
       mediaView.resumeIfNeeded(view.getValue());
     }
   }
 
   @Override
   public void onValueChanged (SliderView view, float factor) {
-    // TODO? mediaView.setSeekProgress(factor);
+    if (sliderSeekPreviewActive) {
+      updateSliderSeekPreview(factor);
+    }
   }
 
   @Override

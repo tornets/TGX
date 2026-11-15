@@ -5920,6 +5920,7 @@
   <string name="PlaybackSpeed120">Slightly faster</string>
   <string name="PlaybackSpeed150">Faster</string>
   <string name="PlaybackSpeed200">Doubled speed</string>
+  <string name="VideoGestureSpeed">3× speed</string>
 
   <string name="PlaybackSpeedHintAudio100">Audio will play at normal speed</string>
   <string name="PlaybackSpeedHintAudio150">Audio will play at 1.5x speed</string>

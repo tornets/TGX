@@ -1622,6 +1622,9 @@ public class MediaCellView extends ViewGroup implements
     }
     if (media != null && canZoom()) {
       if (media.isVideo()) {
+        if (isVideoGestureMode()) {
+          return true;
+        }
         int bound = Screen.dp(FileProgressComponent.DEFAULT_RADIUS);
         int centerX = getMeasuredWidth() / 2;
         int centerY = getMeasuredHeight() / 2;
@@ -1630,6 +1633,111 @@ public class MediaCellView extends ViewGroup implements
       return true;
     }
     return false;
+  }
+
+  @Override
+  public boolean isVideoGestureMode () {
+    return media != null && media.isVideo() && !media.isGifType() && getParent() instanceof MediaView && ((MediaView) getParent()).isVideoGestureMode();
+  }
+
+  @Override
+  public void onVideoDoubleTap (float x, float y) {
+    if (callback != null && media != null) {
+      callback.onVideoDoubleTap(media, x, y);
+    }
+  }
+
+  @Override
+  public void onVideoLongPressStart () {
+    if (callback != null && media != null) {
+      callback.onVideoLongPress(media, true);
+    }
+  }
+
+  @Override
+  public void onVideoLongPressEnd () {
+    if (callback != null && media != null) {
+      callback.onVideoLongPress(media, false);
+    }
+  }
+
+  @Override
+  public void onVideoSeekStart () {
+    if (callback != null && media != null) {
+      callback.onVideoSeekStart(media);
+    }
+  }
+
+  @Override
+  public void onVideoSeekMove (float dx) {
+    if (callback != null && media != null) {
+      callback.onVideoSeekMove(media, dx);
+    }
+  }
+
+  @Override
+  public void onVideoSeekEnd (boolean commit) {
+    if (callback != null && media != null) {
+      callback.onVideoSeekEnd(media, commit);
+    }
+  }
+
+  @Override
+  public void onVideoPageStart () {
+    if (callback != null && media != null) {
+      callback.onVideoPageStart(media);
+    }
+  }
+
+  @Override
+  public void onVideoPageMove (float dy) {
+    if (callback != null && media != null) {
+      callback.onVideoPageMove(media, dy);
+    }
+  }
+
+  @Override
+  public void onVideoPageEnd (float dy, float velocityY) {
+    if (callback != null && media != null) {
+      callback.onVideoPageEnd(media, dy, velocityY);
+    }
+  }
+
+  @Override
+  public void onVideoPageCancel () {
+    if (callback != null && media != null) {
+      callback.onVideoPageCancel(media);
+    }
+  }
+
+  public boolean isVideoPlaying () {
+    return playerView != null && playerView.isPlaying();
+  }
+
+  public void playPauseVideo () {
+    if (playerView != null) {
+      playerView.playPause();
+    }
+  }
+
+  public void seekVideoToMs (long positionMs) {
+    if (playerView != null) {
+      playerView.seekToMs(positionMs);
+    }
+  }
+
+  public long getVideoPositionMs () {
+    return playerView != null ? playerView.getCurrentPositionMs() : 0;
+  }
+
+  public long getVideoDurationMs () {
+    return playerView != null ? playerView.getDurationMs() : 0;
+  }
+
+  public void setVideoSpeed (float speed) {
+    if (playerView != null) {
+      playerView.setPlaybackSpeed(speed);
+    }
   }
 
   private boolean interceptAnyEvents;
@@ -1917,6 +2025,16 @@ public class MediaCellView extends ViewGroup implements
     void onPlayPause (MediaItem item, boolean isPlaying);
     void onPlayStarted (MediaItem item, boolean isPlaying);
     void onSeekSecondaryProgress (MediaItem item, float offset, float progress);
+
+    default void onVideoDoubleTap (MediaItem item, float x, float y) { }
+    default void onVideoLongPress (MediaItem item, boolean started) { }
+    default void onVideoSeekStart (MediaItem item) { }
+    default void onVideoSeekMove (MediaItem item, float dx) { }
+    default void onVideoSeekEnd (MediaItem item, boolean commit) { }
+    default void onVideoPageStart (MediaItem item) { }
+    default void onVideoPageMove (MediaItem item, float dy) { }
+    default void onVideoPageEnd (MediaItem item, float dy, float velocityY) { }
+    default void onVideoPageCancel (MediaItem item) { }
   }
 
   private Callback callback;
@@ -2141,9 +2259,44 @@ public class MediaCellView extends ViewGroup implements
     }
   }
 
+  private boolean bufferingShowPending;
+  private boolean videoBuffering;
+
+  public boolean isVideoBuffering () {
+    return videoBuffering;
+  }
+
+  // 竖向翻页拖动期间隐藏播放器表面、显示静态缩略图，避免 TextureView 位移拖尾重影
+  public void setVideoSurfaceVisible (boolean visible) {
+    setHideStaticView(visible, false);
+  }
+
+  public void setDownloadSpeedText (String text) {
+    bufferingProgressView.setSpeedText(text);
+  }
+
+  private final Runnable bufferingShowRunnable = () -> {
+    if (!bufferingShowPending) {
+      return;
+    }
+    bufferingShowPending = false;
+    bufferingProgressView.setProgressVisible(true, media != null && media.getFileProgress().isDownloaded());
+  };
+
   @Override
   public void onBufferingStateChanged (boolean isBuffering) {
-    bufferingProgressView.setProgressVisible(isBuffering, media != null && media.getFileProgress().isDownloaded());
+    videoBuffering = isBuffering;
+    if (isBuffering) {
+      if (!bufferingShowPending) {
+        bufferingShowPending = true;
+        postDelayed(bufferingShowRunnable, 1200);
+      }
+    } else {
+      bufferingShowPending = false;
+      removeCallbacks(bufferingShowRunnable);
+      bufferingProgressView.setProgressVisible(false, media != null && media.getFileProgress().isDownloaded());
+      bufferingProgressView.setSpeedText(null);
+    }
   }
 
   @Override

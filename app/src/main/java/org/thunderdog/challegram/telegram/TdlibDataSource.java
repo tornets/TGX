@@ -54,15 +54,13 @@ public final class TdlibDataSource extends BaseDataSource {
   @IntDef(value = {
     Flag.NONE,
     Flag.DOWNLOAD_FULLY,
-    Flag.DOWNLOAD_PRECISELY,
-    Flag.OPTIMIZE_CHUNKS
+    Flag.DOWNLOAD_PRECISELY
   }, flag = true)
   public @interface Flag {
     int
       NONE = 0,
       DOWNLOAD_FULLY = 1,
-      DOWNLOAD_PRECISELY = 1 << 1,
-      OPTIMIZE_CHUNKS = 1 << 2;
+      DOWNLOAD_PRECISELY = 1 << 1;
   }
 
   public static final class UriFactory {
@@ -188,7 +186,6 @@ public final class TdlibDataSource extends BaseDataSource {
   private final Object fileLock = new Object();
   private TdApi.File file;
   private DataSource redirectedToDataSource;
-  private long durationMs;
 
   private final FileUpdateListener listener = this::processUpdate;
 
@@ -222,7 +219,6 @@ public final class TdlibDataSource extends BaseDataSource {
       throw new TdlibDataSourceException(PARAM_FILE_ID + " and " + PARAM_REMOTE_ID + " parameters are missing");
     final int priority = modifiedPriority != TdlibFilesManager.PRIORITY_UNSET ? modifiedPriority : StringUtils.parseInt(uri.getQueryParameter(PARAM_PRIORITY), defaultPriority);
     final @Flag int flags = StringUtils.parseInt(uri.getQueryParameter(PARAM_FLAGS), Flag.NONE);
-    final long durationMs = StringUtils.parseLong(uri.getQueryParameter(PARAM_DURATION), 0);
 
     transferInitializing(dataSpec);
 
@@ -230,8 +226,8 @@ public final class TdlibDataSource extends BaseDataSource {
     this.priority = priority;
     this.flags = flags;
     this.initialOffset = bytesRead = dataSpec.position;
+    this.streamingWindowOffset = -1;
     this.maxReadLength = dataSpec.length;
-    this.durationMs = durationMs;
     this.tdlib = TdlibManager.getTdlib(accountId);
 
     final TdApi.Function<TdApi.File> function = !StringUtils.isEmpty(remoteId) ? new TdApi.GetRemoteFile(remoteId, null) : new TdApi.GetFile(fileId);
@@ -322,6 +318,7 @@ public final class TdlibDataSource extends BaseDataSource {
   private final TdApi.File localFile = new TdApi.File(0, 0, 0, new TdApi.LocalFile(), new TdApi.RemoteFile());
   private CountDownLatch latch;
   private RandomAccessFile openFile;
+  private long streamingWindowOffset = -1;
 
   private boolean acquireOrUpdateReference (TdApi.File file, long offset, long limit) {
     if (!referenceAcquired && file.local.canBeDownloaded) {
@@ -341,8 +338,37 @@ public final class TdlibDataSource extends BaseDataSource {
     }
   }
 
-  private static final long MIN_DOWNLOAD_CHUNK_LENGTH = ByteUnit.KIB.toBytes(64);
-  private static final long BIG_DOWNLOAD_CHUNK_LENGTH = ByteUnit.MB.toBytes(5);
+  private static final long STREAMING_WINDOW_LENGTH = ByteUnit.KIB.toBytes(128);
+  private static final long FILE_UPDATE_TIMEOUT_MS = 3000L;
+
+  // A wedged download produces no UpdateFile at all; cancel and re-request so tdlib reconnects.
+  // A progress probe first, so slow-but-alive downloads are left alone.
+  private void awaitFileUpdate (TdApi.File file, long requestOffset, long downloadLimit) throws InterruptedException {
+    CountDownLatch latch;
+    synchronized (fileLock) {
+      latch = this.latch;
+    }
+    if (latch == null) {
+      return;
+    }
+    long baseline = probeDownloadedPrefix(file, requestOffset);
+    if (latch.await(FILE_UPDATE_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+      return;
+    }
+    long current = probeDownloadedPrefix(file, requestOffset);
+    if (current > baseline) {
+      return;
+    }
+    tdlib.send(new TdApi.CancelDownloadFile(file.id, false), tdlib.typedOkHandler());
+    tdlib.files().removeCloudReference(file, listener);
+    referenceAcquired = false;
+    acquireOrUpdateReference(file, requestOffset, downloadLimit);
+  }
+
+  private long probeDownloadedPrefix (TdApi.File file, long offset) {
+    TdApi.FileDownloadedPrefixSize probe = tdlib.clientExecuteT(new TdApi.GetFileDownloadedPrefixSize(file.id, offset), 500L, false);
+    return probe != null ? probe.size : -1L;
+  }
 
   @Override
   public int read (@NonNull byte[] buffer, int bufferOffset, int readLength) throws IOException {
@@ -380,22 +406,34 @@ public final class TdlibDataSource extends BaseDataSource {
         }
 
         long downloadLimit = calculateDownloadLimit(file, offset, readLength);
+        boolean windowed = maxReadLength == C.LENGTH_UNSET && downloadLimit != TdlibFilesManager.LIMIT_MAX;
+        if (windowed && !file.local.isDownloadingCompleted && streamingWindowOffset != -1 && offset >= streamingWindowOffset + STREAMING_WINDOW_LENGTH) {
+          streamingWindowOffset = offset;
+        }
+        long referenceOffset = windowed && streamingWindowOffset != -1 ? streamingWindowOffset : initialOffset;
         if (first) {
           first = false;
           if (file.local.isDownloadingCompleted) {
             releaseReference(file);
           } else {
-            acquireOrUpdateReference(file, initialOffset, downloadLimit);
+            if (windowed && streamingWindowOffset == -1) {
+              streamingWindowOffset = initialOffset;
+              referenceOffset = initialOffset;
+            }
+            acquireOrUpdateReference(file, referenceOffset, downloadLimit);
           }
-        } else if (!file.local.isDownloadingCompleted && !file.local.isDownloadingActive) {
-          acquireOrUpdateReference(file, initialOffset, downloadLimit);
+        } else if (!file.local.isDownloadingCompleted && !file.local.isDownloadingActive && windowed && streamingWindowOffset != -1 && offset >= streamingWindowOffset + STREAMING_WINDOW_LENGTH) {
+          streamingWindowOffset = offset;
+          acquireOrUpdateReference(file, offset, downloadLimit);
+        } else if (!file.local.isDownloadingCompleted && !file.local.isDownloadingActive && !windowed) {
+          acquireOrUpdateReference(file, referenceOffset, downloadLimit);
         }
         long available = getAvailableSize(file, offset, readLength);
         if (available == C.RESULT_END_OF_INPUT) {
           return C.RESULT_END_OF_INPUT;
         }
         if (available == 0) {
-          latch.await();
+          awaitFileUpdate(file, referenceOffset, downloadLimit);
           continue;
         }
         try {
@@ -414,8 +452,8 @@ public final class TdlibDataSource extends BaseDataSource {
           bytesRead += readCount;
           return readCount;
         } catch (IOException e) {
-          if (acquireOrUpdateReference(file, initialOffset, downloadLimit)) {
-            latch.await();
+          if (acquireOrUpdateReference(file, windowed ? offset : referenceOffset, downloadLimit)) {
+            awaitFileUpdate(file, windowed ? offset : referenceOffset, downloadLimit);
           } else {
             throw new TdlibDataSourceException(e);
           }
@@ -426,48 +464,14 @@ public final class TdlibDataSource extends BaseDataSource {
     }
   }
 
-  private static final long PRELOAD_SECONDS = 10;
-
   private long calculateDownloadLimit (TdApi.File file, long offset, int readLength) {
-    long downloadLimit;
     if (BitwiseUtils.hasFlag(flags, Flag.DOWNLOAD_FULLY)) {
-      downloadLimit = TdlibFilesManager.LIMIT_MAX;
+      return TdlibFilesManager.LIMIT_MAX;
     } else if (maxReadLength != C.LENGTH_UNSET) {
-      downloadLimit = maxReadLength;
+      return maxReadLength;
     } else {
-      downloadLimit = offset - initialOffset + readLength;
-      if (!BitwiseUtils.hasFlag(flags, Flag.DOWNLOAD_PRECISELY)) {
-        long minDownloadChunk = MIN_DOWNLOAD_CHUNK_LENGTH;
-        if (BitwiseUtils.hasFlag(flags, Flag.OPTIMIZE_CHUNKS)) {
-          if (file.size != 0 && file.size <= minDownloadChunk * 3) {
-            return TdlibFilesManager.LIMIT_MAX;
-          } else if (durationMs > 0) {
-            if (durationMs <= TimeUnit.SECONDS.toMillis(PRELOAD_SECONDS)) {
-              return TdlibFilesManager.LIMIT_MAX;
-            }
-            double bytesPerSecond = ((double) file.size / (double) durationMs) * 1000.0;
-            long bytesPerPeriod = Math.round(bytesPerSecond * (double) PRELOAD_SECONDS);
-            long extraBytes = bytesPerPeriod % minDownloadChunk;
-            if (extraBytes != 0) {
-              bytesPerPeriod += minDownloadChunk - extraBytes;
-            }
-            minDownloadChunk = Math.max(minDownloadChunk, bytesPerPeriod);
-          }
-        }
-        long remaining = (initialOffset + downloadLimit) % minDownloadChunk;
-        downloadLimit += minDownloadChunk - remaining;
-        if (file.size != 0) {
-          if (initialOffset + downloadLimit > file.size) {
-            downloadLimit = file.size - initialOffset;
-          }
-          long bytesRemaining = file.size - downloadLimit;
-          if (bytesRemaining <= minDownloadChunk) {
-            downloadLimit = TdlibFilesManager.LIMIT_MAX;
-          }
-        }
-      }
+      return STREAMING_WINDOW_LENGTH;
     }
-    return downloadLimit;
   }
 
   @Nullable

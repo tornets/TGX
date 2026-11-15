@@ -15,11 +15,15 @@ package org.thunderdog.challegram.mediaview;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
 import android.graphics.RectF;
+import android.text.TextPaint;
 import android.view.View;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
+import org.thunderdog.challegram.tool.Fonts;
 import org.thunderdog.challegram.tool.Paints;
 import org.thunderdog.challegram.tool.Screen;
 import org.thunderdog.challegram.tool.UI;
@@ -33,6 +37,8 @@ import me.vkryl.core.lambda.Destroyable;
 
 public class BufferingProgressBarWrap extends View implements Destroyable {
   private final RectF fakeDialogFrame = new RectF();
+  private final TextPaint speedTextPaint;
+  private @Nullable String speedText;
   private ProgressComponent progressComponent;
 
   private final BoolAnimator progressVisible = new BoolAnimator(0, (id, factor, fraction, callee) -> {
@@ -44,6 +50,11 @@ public class BufferingProgressBarWrap extends View implements Destroyable {
   public BufferingProgressBarWrap (@NonNull Context context) {
     super(context);
     setWillNotDraw(false);
+    speedTextPaint = new TextPaint(Paint.ANTI_ALIAS_FLAG);
+    speedTextPaint.setColor(Color.WHITE);
+    speedTextPaint.setTypeface(Fonts.getRobotoMedium());
+    speedTextPaint.setTextSize(Screen.dp(12f));
+    speedTextPaint.setTextAlign(android.graphics.Paint.Align.CENTER);
     progressComponent = new ProgressComponent(UI.getContext(getContext()), Screen.dp(18f));
     progressComponent.forceColor(Color.WHITE);
     progressComponent.setUseStupidInvalidate();
@@ -102,14 +113,28 @@ public class BufferingProgressBarWrap extends View implements Destroyable {
     }
   }
 
+  public void setSpeedText (@Nullable String text) {
+    if (!java.util.Objects.equals(speedText, text)) {
+      speedText = text;
+      invalidate();
+    }
+  }
+
   @Override
   protected void onDraw (Canvas canvas) {
     super.onDraw(canvas);
 
     final int color = 0x4c000000;
-    final int bgColor = ColorUtils.color((int) ((float) Color.alpha(color) * progressVisible.getFloatValue()), color);
+    final float alpha = progressVisible.getFloatValue();
+    final int bgColor = ColorUtils.color((int) ((float) Color.alpha(color) * alpha), color);
 
     canvas.drawRoundRect(fakeDialogFrame, Screen.dp(12f), Screen.dp(12f), Paints.getPorterDuffPaint(bgColor));
     progressComponent.draw(canvas);
+    if (speedText != null && alpha > 0.1f) {
+      speedTextPaint.setAlpha((int) (255f * alpha));
+      final int cx = getMeasuredWidth() / 2;
+      final float baseY = getMeasuredHeight() / 2f + Screen.dp(42f) + Screen.dp(20f);
+      canvas.drawText(speedText, cx, baseY, speedTextPaint);
+    }
   }
 }

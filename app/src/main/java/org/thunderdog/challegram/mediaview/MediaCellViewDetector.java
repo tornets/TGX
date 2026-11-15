@@ -20,6 +20,7 @@ import android.graphics.Rect;
 import android.graphics.RectF;
 import android.os.SystemClock;
 import android.view.MotionEvent;
+import android.view.VelocityTracker;
 import android.view.View;
 import android.view.ViewConfiguration;
 
@@ -47,6 +48,18 @@ public class MediaCellViewDetector implements FactorAnimator.Target {
 
     void getZoomDisplayRect (Rect rect);
     void getZoomContentRect (Rect rect);
+
+    boolean isVideoGestureMode ();
+    void onVideoDoubleTap (float x, float y);
+    void onVideoLongPressStart ();
+    void onVideoLongPressEnd ();
+    void onVideoSeekStart ();
+    void onVideoSeekMove (float dx);
+    void onVideoSeekEnd (boolean commit);
+    void onVideoPageStart ();
+    void onVideoPageMove (float dy);
+    void onVideoPageEnd (float dy, float velocityY);
+    void onVideoPageCancel ();
   }
 
   private final View target;
@@ -66,14 +79,50 @@ public class MediaCellViewDetector implements FactorAnimator.Target {
   private boolean listenClick;
   private float downStartX, downStartY;
 
+  private CancellableRunnable longPressRunnable;
+  private boolean longPressActive;
+  private boolean videoSeeking;
+  private boolean videoPaging;
+  private VelocityTracker pageVelocity;
+
+  private void obtainPageVelocity (MotionEvent e) {
+    if (pageVelocity == null) {
+      pageVelocity = VelocityTracker.obtain();
+    }
+    pageVelocity.addMovement(e);
+  }
+
+  private void recyclePageVelocity () {
+    if (pageVelocity != null) {
+      pageVelocity.recycle();
+      pageVelocity = null;
+    }
+  }
+
   public boolean onTouchEvent (MotionEvent e) {
     int action = e.getActionMasked();
 
     int pointerCount = e.getPointerCount();
     setState(e, pointerCount == 2 ? STATE_ZOOMING : pointerCount == 1 && zoom > 1f && (action != MotionEvent.ACTION_UP && action != MotionEvent.ACTION_CANCEL && callback.canMoveZoomedView()) ? STATE_MOVING : STATE_NONE);
 
-    if (pointerCount != 1 && listenClick) {
-      listenClick = false;
+    if (pointerCount != 1) {
+      if (listenClick) {
+        listenClick = false;
+      }
+      cancelLongPress();
+      recyclePageVelocity();
+      if (longPressActive) {
+        longPressActive = false;
+        callback.onVideoLongPressEnd();
+      }
+      if (videoSeeking) {
+        videoSeeking = false;
+        callback.onVideoSeekEnd(false);
+      }
+      if (videoPaging) {
+        videoPaging = false;
+        callback.onVideoPageCancel();
+      }
     }
 
     switch (action) {
@@ -81,24 +130,90 @@ public class MediaCellViewDetector implements FactorAnimator.Target {
         listenClick = pointerCount == 1;
         downStartX = e.getX();
         downStartY = e.getY();
+        if (listenClick) {
+          obtainPageVelocity(e);
+        }
+        if (pointerCount == 1 && zoom == 1f && callback.isVideoGestureMode()) {
+          scheduleLongPress();
+        }
         break;
       }
       case MotionEvent.ACTION_CANCEL: {
         listenClick = false;
+        cancelLongPress();
+        recyclePageVelocity();
+        if (longPressActive) {
+          longPressActive = false;
+          callback.onVideoLongPressEnd();
+        }
+        if (videoSeeking) {
+          videoSeeking = false;
+          callback.onVideoSeekEnd(false);
+        }
+        if (videoPaging) {
+          videoPaging = false;
+          callback.onVideoPageCancel();
+        }
         break;
       }
       case MotionEvent.ACTION_UP: {
+        cancelLongPress();
+        float velocityY = 0f;
+        if (pageVelocity != null) {
+          pageVelocity.addMovement(e);
+          pageVelocity.computeCurrentVelocity(1000);
+          velocityY = pageVelocity.getYVelocity();
+          recyclePageVelocity();
+        }
+        if (longPressActive) {
+          longPressActive = false;
+          listenClick = false;
+          callback.onVideoLongPressEnd();
+        }
+        if (videoSeeking) {
+          videoSeeking = false;
+          listenClick = false;
+          callback.onVideoSeekEnd(true);
+        }
+        if (videoPaging) {
+          videoPaging = false;
+          listenClick = false;
+          callback.onVideoPageEnd(e.getY() - downStartY, velocityY);
+        }
         if (listenClick) {
           onClick(e.getX(), e.getY());
         }
         break;
       }
       case MotionEvent.ACTION_MOVE: {
+        if (pageVelocity != null && videoPaging) {
+          obtainPageVelocity(e);
+        }
         if (listenClick && Math.max(Math.abs(e.getX() - downStartX), Math.abs(e.getY() - downStartY)) > Screen.getTouchSlopBig()) {
           listenClick = false;
+          cancelLongPress();
           if (state == STATE_MOVING) {
             onMoveStart(e);
           }
+        }
+        if (!videoSeeking && !videoPaging && !listenClick && !longPressActive && state == STATE_NONE && zoom == 1f && callback.isVideoGestureMode()) {
+          float dx = e.getX() - downStartX;
+          float dy = e.getY() - downStartY;
+          if (Math.abs(dx) > Screen.getTouchSlopBig() && Math.abs(dx) > Math.abs(dy)) {
+            videoSeeking = true;
+            cancelLongPress();
+            callback.onVideoSeekStart();
+          } else if (Math.abs(dy) > Screen.getTouchSlopBig() && Math.abs(dy) > Math.abs(dx)) {
+            videoPaging = true;
+            cancelLongPress();
+            callback.onVideoPageStart();
+          }
+        }
+        if (videoSeeking) {
+          callback.onVideoSeekMove(e.getX() - downStartX);
+        }
+        if (videoPaging) {
+          callback.onVideoPageMove(e.getY() - downStartY);
         }
         switch (state) {
           case STATE_MOVING: {
@@ -117,6 +232,29 @@ public class MediaCellViewDetector implements FactorAnimator.Target {
     }
 
     return true;
+  }
+
+  private void scheduleLongPress () {
+    cancelLongPress();
+    UI.post(longPressRunnable = new CancellableRunnable() {
+      @Override
+      public void act () {
+        longPressRunnable = null;
+        if (listenClick && zoom == 1f) {
+          longPressActive = true;
+          listenClick = false;
+          cancelClick();
+          callback.onVideoLongPressStart();
+        }
+      }
+    }, ViewConfiguration.getLongPressTimeout());
+  }
+
+  private void cancelLongPress () {
+    if (longPressRunnable != null) {
+      longPressRunnable.cancel();
+      longPressRunnable = null;
+    }
   }
 
   private long lastClickTime;
@@ -151,6 +289,12 @@ public class MediaCellViewDetector implements FactorAnimator.Target {
   }
 
   private void performDoubleTap (float x, float y) {
+    lastClickTime = 0;
+    if (zoom == 1f && callback.isVideoGestureMode()) {
+      callback.onVideoDoubleTap(x, y);
+      ViewUtils.onClick(target);
+      return;
+    }
     if (zoom > 1f) {
       animatePosition(1f, pivotX, pivotY, 0f, 0f, true);
       ViewUtils.onClick(target);
@@ -175,6 +319,20 @@ public class MediaCellViewDetector implements FactorAnimator.Target {
   public void reset () {
     forcePosition(1f, 0f, 0f);
     setState(null, STATE_NONE);
+    cancelLongPress();
+    if (longPressActive) {
+      longPressActive = false;
+      callback.onVideoLongPressEnd();
+    }
+    if (videoSeeking) {
+      videoSeeking = false;
+      callback.onVideoSeekEnd(false);
+    }
+    if (videoPaging) {
+      videoPaging = false;
+      callback.onVideoPageCancel();
+    }
+    recyclePageVelocity();
   }
 
   public void forcePosition (float zoom, float positionX, float positionY) {

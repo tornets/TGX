@@ -647,7 +647,7 @@ public class MediaView extends FrameLayoutFix {
         stopAnimator();
         updateValues(downStartX);
 
-        listenMove = !isMoving && e.getPointerCount() == 1;
+        listenMove = !isMoving && e.getPointerCount() == 1 && !isVideoGestureMode();
 
         if (!isMoving) {
           return detector.onTouchEvent(e);
@@ -828,11 +828,128 @@ public class MediaView extends FrameLayoutFix {
     return !inSingleMode() && stack.hasNext();
   }
 
+  // Vertical page switching between videos
+
+  private boolean verticalPageActive;
+  private int verticalPageDelta;
+  private int verticalPageDir;
+  private ValueAnimator verticalPageAnimator;
+
+  public boolean startVideoPage () {
+    if (isAnimating || verticalPageActive || verticalPageAnimator != null || inSingleMode() || stack == null || previewCell == null || getMeasuredHeight() == 0) {
+      return false;
+    }
+    verticalPageActive = true;
+    verticalPageDelta = 0;
+    verticalPageDir = 0;
+    baseCell.setVideoSurfaceVisible(false);
+    return true;
+  }
+
+  private int findVideoSibling (boolean forward) {
+    int from = stack.getCurrentIndex();
+    int size = stack.getCurrentSize();
+    int step = forward ? 1 : -1;
+    for (int i = from + step; i >= 0 && i < size; i += step) {
+      MediaItem item = stack.get(i);
+      if (item != null && item.getType() == MediaItem.TYPE_VIDEO) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  public void moveVideoPage (float dy) {
+    if (!verticalPageActive || verticalPageAnimator != null) {
+      return;
+    }
+    if (verticalPageDir == 0) {
+      if (Math.abs(dy) < Screen.getTouchSlopBig()) {
+        return;
+      }
+      verticalPageDir = dy < 0 ? 1 : -1; // up → next video slides in from bottom
+      int target = findVideoSibling(verticalPageDir > 0);
+      if (target == -1) {
+        return;
+      }
+      verticalPageDelta = target - stack.getCurrentIndex();
+      previewCell.setMedia(stack.get(stack.getCurrentIndex() + verticalPageDelta));
+    }
+    float clamped = Math.max(-getMeasuredHeight(), Math.min(getMeasuredHeight(), dy));
+    baseCell.setTranslationY(clamped);
+    previewCell.setTranslationY(verticalPageDir * getMeasuredHeight() + clamped);
+  }
+
+  public void endVideoPage (float dy, float velocityY, boolean commitAllowed) {
+    if (!verticalPageActive) {
+      return;
+    }
+    verticalPageActive = false;
+    if (verticalPageAnimator != null) {
+      return;
+    }
+    int dir = verticalPageDir != 0 ? verticalPageDir : 1;
+    boolean towardTarget = dy * verticalPageDir < 0;
+    boolean fastFling = velocityY * verticalPageDir < 0 && Math.abs(velocityY) > Screen.dp(500f);
+    boolean commit = commitAllowed && verticalPageDelta != 0 && (towardTarget || fastFling) && (Math.abs(dy) > getMeasuredHeight() * 0.12f || fastFling);
+    float baseTo = commit ? -dir * getMeasuredHeight() : 0f;
+    float previewTo = commit ? 0f : dir * getMeasuredHeight();
+    float baseFrom = baseCell.getTranslationY();
+    float previewFrom = previewCell != null ? previewCell.getTranslationY() : 0f;
+    verticalPageAnimator = AnimatorUtils.simpleValueAnimator();
+    verticalPageAnimator.addUpdateListener(animation -> {
+      float fraction = AnimatorUtils.getFraction(animation);
+      baseCell.setTranslationY(baseFrom + (baseTo - baseFrom) * fraction);
+      if (previewCell != null) {
+        previewCell.setTranslationY(previewFrom + (previewTo - previewFrom) * fraction);
+      }
+    });
+    verticalPageAnimator.addListener(new AnimatorListenerAdapter() {
+      @Override
+      public void onAnimationEnd (Animator animation) {
+        verticalPageAnimator = null;
+        if (commit) {
+          stack.applyDelta(verticalPageDelta);
+          setFactorImpl(0f);
+          translateCells();
+          MediaCellView cell = baseCell;
+          baseCell = previewCell;
+          previewCell = cell;
+          translateCells();
+        } else if (previewCell != null && verticalPageDelta != 0) {
+          previewCell.setMedia(null);
+        }
+        baseCell.setTranslationY(0f);
+        if (previewCell != null) {
+          previewCell.setTranslationY(0f);
+        }
+        baseCell.setVideoSurfaceVisible(true);
+        baseCell.autoplayIfNeeded(false);
+        verticalPageDelta = 0;
+        verticalPageDir = 0;
+      }
+    });
+    verticalPageAnimator.setDuration(200);
+    verticalPageAnimator.start();
+  }
+
+  public void cancelVideoPage () {
+    endVideoPage(0f, 0f, false);
+  }
+
   public boolean hasPrevious () {
     return !inSingleMode() && stack.hasPrevious();
   }
 
   public boolean inSingleMode () {
     return disallowMove;
+  }
+
+  public boolean isVideoGestureMode () {
+    if (boundController == null || !boundController.allowVideoGestures() || stack == null) {
+      return false;
+    }
+    MediaItem current = stack.getCurrent();
+    return current != null && current.isVideo() && !current.isGifType();
   }
 }

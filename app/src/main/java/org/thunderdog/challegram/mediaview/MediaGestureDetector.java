@@ -42,7 +42,7 @@ public class MediaGestureDetector implements GestureDetector.OnGestureListener, 
 
   @Override
   public boolean onFling (MotionEvent e1, MotionEvent e2, float velocityX, float velocityY) {
-    if (boundView == null || boundView.inSingleMode()) {
+    if (boundView == null || boundView.inSingleMode() || boundView.isVideoGestureMode()) {
       return false;
     }
 

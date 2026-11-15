@@ -55,19 +55,18 @@ public class SliderView extends View implements FactorAnimator.Target {
   }
 
   private float value; // -1f..0f -- left to center, 0..1f -- center to right
-  private float secondaryValue, secondaryValueOffset; // -1f..0f -- left to center, 0..1f -- center to right
+  private float[] cachedSegments;
 
-  public void setValue (float value) {
-    if (this.value != value) {
-      this.value = value;
+  public void setCachedSegments (float[] segments) {
+    if (!java.util.Arrays.equals(this.cachedSegments, segments)) {
+      this.cachedSegments = segments;
       invalidate();
     }
   }
 
-  public void setSecondaryValue (float offset, float value) {
-    if (this.secondaryValueOffset != offset || this.secondaryValue != value) {
-      this.secondaryValueOffset = offset;
-      this.secondaryValue = value;
+  public void setValue (float value) {
+    if (this.value != value) {
+      this.value = value;
       invalidate();
     }
   }
@@ -443,11 +442,15 @@ public class SliderView extends View implements FactorAnimator.Target {
       c.drawRoundRect(rectF, height, height, Paints.fillingPaint(inactiveColor));
     }
 
-    if (secondaryValue > 0f && anchorMode == ANCHOR_MODE_START) {
-      float leftX = left + (float) width * secondaryValueOffset;
-      float rightX = leftX + (float) width * secondaryValue;
-      rectF.set(leftX, top, rightX, bottom);
-      c.drawRoundRect(rectF, height, height, Paints.fillingPaint(secondaryColor));
+    if (cachedSegments != null && anchorMode == ANCHOR_MODE_START) {
+      for (int i = 0; i + 1 < cachedSegments.length; i += 2) {
+        float leftX = left + (float) width * cachedSegments[i];
+        float rightX = left + (float) width * cachedSegments[i + 1];
+        if (rightX > leftX) {
+          rectF.set(leftX, top, rightX, bottom);
+          c.drawRoundRect(rectF, height, height, Paints.fillingPaint(secondaryColor));
+        }
+      }
     }
 
     int cx;

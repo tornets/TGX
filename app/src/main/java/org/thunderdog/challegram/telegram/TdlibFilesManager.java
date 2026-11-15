@@ -126,6 +126,7 @@ public class TdlibFilesManager implements GlobalConnectionListener {
   public static final int OFFSET_UNSET = C.INDEX_UNSET;
   public static final int LIMIT_UNSET = C.LENGTH_UNSET;
   public static final int LIMIT_MAX = 0; // Instruct to download fully
+  private static final long MAX_STREAMING_WINDOW = ByteUnit.KIB.toBytes(128);
 
   private static class DownloadOperation {
     private static class Chunk {
@@ -240,7 +241,7 @@ public class TdlibFilesManager implements GlobalConnectionListener {
 
       final long requestedEnd = requestedOffset + requestedLimit;
       if (requestedLimit != LIMIT_MAX) {
-        if (offset == requestedEnd) {
+        if (offset == requestedEnd && requestedLimit < MAX_STREAMING_WINDOW) {
           // Sequential request: grow limit
           if (limit == LIMIT_MAX) {
             requestedLimit = limit;
@@ -249,7 +250,7 @@ public class TdlibFilesManager implements GlobalConnectionListener {
           }
           return true;
         }
-        if (offset > requestedEnd && offset - requestedEnd <= ByteUnit.KIB.toBytes(128)) {
+        if (offset > requestedEnd && offset - requestedEnd <= ByteUnit.KIB.toBytes(128) && requestedLimit < MAX_STREAMING_WINDOW) {
           // Gap from previous part is small: grow limit
           if (limit == LIMIT_MAX) {
             requestedLimit = LIMIT_MAX;

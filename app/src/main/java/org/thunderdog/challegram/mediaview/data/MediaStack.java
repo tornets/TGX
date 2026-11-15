@@ -248,4 +248,11 @@ public class MediaStack {
     currentIndex--;
     notifyMediaChanged(false);
   }
+
+  public void applyDelta (int delta) {
+    if (delta != 0) {
+      currentIndex += delta;
+      notifyMediaChanged(false);
+    }
+  }
 }

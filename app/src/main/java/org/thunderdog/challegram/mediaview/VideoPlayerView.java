@@ -34,6 +34,7 @@ import androidx.media3.common.Effect;
 import androidx.media3.common.Format;
 import androidx.media3.common.MimeTypes;
 import androidx.media3.common.PlaybackException;
+import androidx.media3.common.PlaybackParameters;
 import androidx.media3.common.Player;
 import androidx.media3.common.VideoSize;
 import androidx.media3.exoplayer.ExoPlaybackException;
@@ -280,7 +281,7 @@ public class VideoPlayerView implements Player.Listener, CallManager.CurrentCall
           source = U.newMediaSource(mediaItem.tdlib().id(), hlsVideo);
         } else {
           long durationMs = mediaItem.getVideoDuration(false, TimeUnit.MILLISECONDS);
-          source = U.newMediaSource(mediaItem.tdlib().id(), targetFile, TdlibFilesManager.PRIORITY_STREAMING_VIDEO, TdlibDataSource.Flag.OPTIMIZE_CHUNKS, durationMs);
+          source = U.newMediaSource(mediaItem.tdlib().id(), targetFile, TdlibFilesManager.PRIORITY_STREAMING_VIDEO, TdlibDataSource.Flag.NONE, durationMs);
           alternativesOfOriginal = allowsHls ? hlsVideo : null;
         }
         forcePlay = mediaItem.getType() == MediaItem.TYPE_GIF;
@@ -743,6 +744,31 @@ public class VideoPlayerView implements Player.Listener, CallManager.CurrentCall
         player.setPlayWhenReady(true);
       }
       updateTimes();
+    }
+  }
+
+  public long getCurrentPositionMs () {
+    return player != null ? player.getCurrentPosition() : 0;
+  }
+
+  public long getDurationMs () {
+    if (player == null) {
+      return 0;
+    }
+    long duration = player.getDuration();
+    return duration != C.TIME_UNSET ? duration : 0;
+  }
+
+  public void seekToMs (long positionMs) {
+    if (player != null) {
+      player.seekTo(Math.max(0, Math.min(getDurationMs(), positionMs)));
+      updateTimes();
+    }
+  }
+
+  public void setPlaybackSpeed (float speed) {
+    if (player != null) {
+      player.setPlaybackParameters(new PlaybackParameters(speed));
     }
   }
 }

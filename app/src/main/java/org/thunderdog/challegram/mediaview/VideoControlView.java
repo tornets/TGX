@@ -62,7 +62,6 @@ public class VideoControlView extends FrameLayoutFix implements FactorAnimator.T
     sliderView = new SliderView(context);
     sliderView.setAnchorMode(SliderView.ANCHOR_MODE_START);
     sliderView.setForceBackgroundColorId(ColorId.videoSliderInactive);
-    sliderView.setForceSecondaryColorId(ColorId.videoSliderInactive);
     sliderView.setSlideEnabled(true, false);
     sliderView.setColorId(ColorId.videoSliderActive, false);
     sliderView.setPadding(Screen.dp(56f), 0, Screen.dp(56f), 0);
@@ -281,6 +280,10 @@ public class VideoControlView extends FrameLayoutFix implements FactorAnimator.T
     }
   }
 
+  public void updateSeekTime (long nowMs) {
+    setNowMs(nowMs);
+  }
+
   public void updateSeek (long nowDurationMs, long durationMs, float progress) {
     setNowMs(nowDurationMs);
     setTotalMs(durationMs);
@@ -293,9 +296,12 @@ public class VideoControlView extends FrameLayoutFix implements FactorAnimator.T
     }
   }
 
-  public void updateSecondarySeek (float offset, float progress) {
+  public void updateCachedSegments (float[] segments) {
     if (sliderView != null) {
-      sliderView.setSecondaryValue(offset, progress);
+      sliderView.setCachedSegments(segments);
+    }
+    if (timelineView != null) {
+      timelineView.setCachedSegments(segments);
     }
   }
 

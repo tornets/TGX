@@ -727,6 +727,18 @@ public class VideoTimelineView extends View implements Destroyable, FactorAnimat
       c.drawLine(x, startY, x, endY, Paints.getProgressPaint(ColorUtils.alphaColor(alpha, color), strokeWidth));
       c.drawCircle(x, endY + circleRadius, circleRadius, Paints.fillingPaint(ColorUtils.alphaColor(alpha, color)));
     }
+
+    if (cachedSegments != null) {
+      int y = paddingTop + timelineHeight + Screen.dp(4f);
+      int cachedColor = ColorUtils.alphaColor(.6f, barsColor);
+      for (int i = 0; i + 1 < cachedSegments.length; i += 2) {
+        int segLeftX = paddingLeft + (int) (timelineWidth * cachedSegments[i]);
+        int segRightX = paddingLeft + (int) (timelineWidth * cachedSegments[i + 1]);
+        if (segRightX > segLeftX) {
+          c.drawRect(segLeftX, y, segRightX, y + Screen.dp(2f), Paints.fillingPaint(cachedColor));
+        }
+      }
+    }
   }
 
   private static class Frame implements FactorAnimator.Target {
@@ -853,6 +865,15 @@ public class VideoTimelineView extends View implements Destroyable, FactorAnimat
   }
 
   private float sliderProgress;
+
+  private float[] cachedSegments;
+
+  public void setCachedSegments (float[] segments) {
+    if (!java.util.Arrays.equals(this.cachedSegments, segments)) {
+      this.cachedSegments = segments;
+      invalidate();
+    }
+  }
 
   public void setSliderProgress (float progress) {
     if (this.sliderProgress != progress && !(isMoving && slideMode == SLIDE_MODE_SEEK)) {
