@@ -12,6 +12,11 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Fetch LFS objects in submodules
+        run: |
+          git lfs install
+          git submodule foreach --recursive git lfs pull
+
       - name: Set up JDK 25
         uses: actions/setup-java@v4
         with:
