@@ -295,8 +295,9 @@ jobs:
           } > release-notes.md
 
           if gh release view "$TAG" > /dev/null 2>&1; then
-            echo "Release $TAG already exists, uploading assets into it"
+            echo "Release $TAG already exists, updating assets and notes"
             gh release upload "$TAG" "$APK_DIR"/*.apk "$APK_DIR"/*.apk.sha256 --clobber
+            gh release edit "$TAG" --title "TGX $VERSION_NAME" --notes-file release-notes.md
             exit 0
           fi
 
