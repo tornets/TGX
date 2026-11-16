@@ -220,8 +220,13 @@ jobs:
 
             "$APKSIGNER" verify --verbose --print-certs "$APK"
 
+            # Do not rely on a fixed "Signer #1" prefix: apksigner prints
+            # "V3.0 Signer: certificate SHA-256 digest: ..." when only the v3
+            # scheme is present, and "Signer #1 certificate SHA-256 digest: ..."
+            # when a v1/v2 signer exists. Match the suffix only.
             ACTUAL_CERT_SHA256="$("$APKSIGNER" verify --print-certs "$APK" \
-              | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n 1 | tr 'A-F' 'a-f')"
+              | sed -n 's/.*certificate SHA-256 digest: *//p' | head -n 1 \
+              | tr -d ':' | tr 'A-F' 'a-f')"
             if [ "$ACTUAL_CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]; then
               echo "::error::$APK_NAME is signed with $ACTUAL_CERT_SHA256, expected $EXPECTED_CERT_SHA256"
               exit 1
