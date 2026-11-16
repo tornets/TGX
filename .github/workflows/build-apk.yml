@@ -148,22 +148,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Firebase is intentionally not bundled with this build. Providing a
-          # custom google_services.file keeps the google-services Gradle plugin
-          # from being applied at all (app/build.gradle.kts:1269-1276), which is
-          # what avoids the "No matching client found for package name" failure.
-          # The empty client list makes hasGoogleServicesClient() return false,
-          # so the build turns FCM off instead of failing.
-          cat > google-services-placeholder.json <<'EOF'
-          {
-            "project_info": {
-              "project_number": "0",
-              "project_id": "not-configured"
-            },
-            "client": []
-          }
-          EOF
-
+          # Firebase config for com.tornets.tgx is tracked at app/google-services.json.
+          # Pointing google_services.file at it keeps the google-services Gradle
+          # plugin from being applied (app/build.gradle.kts:1269-1276) while
+          # googleServicesValues() injects the FCM resources directly, so push
+          # notifications work without the plugin.
           cat > local.properties <<EOF
           sdk.dir=$ANDROID_HOME
           rust.dir=$(rustup show home)
@@ -171,7 +160,7 @@ jobs:
           app.id=com.tornets.tgx
           app.name=TGX
           app.download_url=https://github.com/tornets/TGX/releases/latest
-          google_services.file=google-services-placeholder.json
+          google_services.file=app/google-services.json
           telegram.api_id=${TG_API_ID:-94575}
           telegram.api_hash=${TG_API_HASH:-a3406de8d171bb422bb6ddf3bbd800e2}
           EOF
@@ -182,11 +171,8 @@ jobs:
       - name: Build release APK
         run: |
           set -euo pipefail
-          # validateApiTokens only passes with a real google-services.json for
-          # com.tornets.tgx, which this build deliberately does not use.
           ./gradlew :app:assembleLatestRelease \
             -Pabi="$ABI" \
-            -x validateApiTokens \
             --no-daemon \
             --stacktrace
 
@@ -304,7 +290,7 @@ jobs:
               echo "| \`$(basename "${checksum%.sha256}")\` | \`$(cut -d' ' -f1 "$checksum")\` |"
             done
             echo
-            echo "> Firebase is not bundled in this build, so push notifications are disabled."
+            echo "> FCM push notifications are enabled (Firebase project mytgx-1ae97, package com.tornets.tgx)."
             echo "> Install only over a build signed with the same certificate."
           } > release-notes.md
 
@@ -333,5 +319,5 @@ jobs:
       - name: Clean up signing material
         if: always()
         run: |
-          rm -f keystore.properties google-services-placeholder.json release-notes.md
+          rm -f keystore.properties release-notes.md
           rm -rf "$RUNNER_TEMP/signing"
