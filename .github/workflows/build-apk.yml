@@ -1,11 +1,59 @@
-name: Build Android APK
+name: Build & Release APK
 
 on:
   workflow_dispatch:
+    inputs:
+      abi:
+        description: 'ABI to build'
+        required: true
+        default: 'arm64'
+        type: choice
+        options:
+          - arm64
+          - arm32
+          - x64
+          - x86
+          - all
+      tag:
+        description: 'Release tag (leave empty to derive it from the app version)'
+        required: false
+        default: ''
+      prerelease:
+        description: 'Mark the release as a pre-release'
+        required: false
+        default: false
+        type: boolean
+      draft:
+        description: 'Create the release as a draft'
+        required: false
+        default: false
+        type: boolean
+      publish_release:
+        description: 'Publish a GitHub Release (uncheck to only upload the build artifact)'
+        required: false
+        default: true
+        type: boolean
+  push:
+    tags:
+      - 'v*'
+
+# The repository default is a read-only GITHUB_TOKEN; creating a release and
+# uploading assets to it requires an explicit write permission.
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
+    name: Build signed release APK
     runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      ABI: ${{ inputs.abi || 'arm64' }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -47,38 +95,238 @@ jobs:
           rustup toolchain install "${{ steps.versions.outputs.rust }}" --profile minimal \
             --target aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
 
-      - name: Generate google-services file for com.tornets.tgx
+      # Signing material is provided by the org-level secrets of `tornets`:
+      # APK_KEYSTORE_BASE64, APK_KEYSTORE_PASSWORD, APK_KEY_ALIAS, APK_KEY_PASSWORD
+      - name: Set up org signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.APK_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.APK_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.APK_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.APK_KEY_PASSWORD }}
         run: |
-          python3 - <<'EOF'
-          import json
-          d = json.load(open('app/google-services.json'))
-          for c in d['client']:
-              c['client_info']['android_client_info']['package_name'] = 'com.tornets.tgx'
-          json.dump(d, open('google-services-tornets.json', 'w'), indent=2)
+          set -euo pipefail
+
+          : "${KEYSTORE_BASE64:?org secret APK_KEYSTORE_BASE64 is not set}"
+          : "${KEYSTORE_PASSWORD:?org secret APK_KEYSTORE_PASSWORD is not set}"
+          : "${KEY_ALIAS:?org secret APK_KEY_ALIAS is not set}"
+          : "${KEY_PASSWORD:?org secret APK_KEY_PASSWORD is not set}"
+
+          KEYSTORE_DIR="$RUNNER_TEMP/signing"
+          mkdir -p "$KEYSTORE_DIR"
+          KEYSTORE_PATH="$KEYSTORE_DIR/release.jks"
+
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+          chmod 600 "$KEYSTORE_PATH"
+
+          # Gradle reads these four keys from the file referenced by keystore.file,
+          # see buildSrc/src/main/kotlin/Config.kt:122-135 and KeystoreSource.kt:15-27.
+          cat > "$GITHUB_WORKSPACE/keystore.properties" <<EOF
+          keystore.file=$KEYSTORE_PATH
+          keystore.password=$KEYSTORE_PASSWORD
+          key.alias=$KEY_ALIAS
+          key.password=$KEY_PASSWORD
           EOF
+          chmod 600 "$GITHUB_WORKSPACE/keystore.properties"
+
+          # Fail fast if the archive cannot be opened or the alias is wrong
+          keytool -list -keystore "$KEYSTORE_PATH" -storepass:env KEYSTORE_PASSWORD -alias "$KEY_ALIAS" > /dev/null
+
+          CERT_DUMP="$(keytool -list -v -keystore "$KEYSTORE_PATH" -storepass:env KEYSTORE_PASSWORD -alias "$KEY_ALIAS")"
+          CERT_SHA256="$(printf '%s\n' "$CERT_DUMP" | sed -n 's/^[[:space:]]*SHA256: //p' | tr -d ':' | tr 'A-F' 'a-f')"
+          CERT_SHA256="${CERT_SHA256%%$'\n'*}"
+          if [ -z "$CERT_SHA256" ]; then
+            echo "::error::Could not read the signing certificate fingerprint from the keystore"
+            exit 1
+          fi
+          echo "Signing certificate SHA-256: $CERT_SHA256"
+          echo "EXPECTED_CERT_SHA256=$CERT_SHA256" >> "$GITHUB_ENV"
 
       - name: Create local.properties
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
         run: |
+          set -euo pipefail
+
+          # Firebase is intentionally not bundled with this build. Providing a
+          # custom google_services.file keeps the google-services Gradle plugin
+          # from being applied at all (app/build.gradle.kts:1269-1276), which is
+          # what avoids the "No matching client found for package name" failure.
+          # The empty client list makes hasGoogleServicesClient() return false,
+          # so the build turns FCM off instead of failing.
+          cat > google-services-placeholder.json <<'EOF'
+          {
+            "project_info": {
+              "project_number": "0",
+              "project_id": "not-configured"
+            },
+            "client": []
+          }
+          EOF
+
           cat > local.properties <<EOF
           sdk.dir=$ANDROID_HOME
           rust.dir=$(rustup show home)
+          keystore.file=$GITHUB_WORKSPACE/keystore.properties
           app.id=com.tornets.tgx
           app.name=TGX
-          google_services.file=google-services-tornets.json
+          app.download_url=https://github.com/tornets/TGX/releases/latest
+          google_services.file=google-services-placeholder.json
           telegram.api_id=${TG_API_ID:-94575}
           telegram.api_hash=${TG_API_HASH:-a3406de8d171bb422bb6ddf3bbd800e2}
           EOF
-          cat local.properties
 
-      - name: Build debug APK (arm64)
-        run: ./gradlew :app:assembleLatestDebug -Pabi=arm64 --no-daemon --stacktrace
+          # Do not print the API hash into the log
+          grep -Ev '^(telegram\.api_hash)=' local.properties
 
-      - name: Upload APK
+      - name: Build release APK
+        run: |
+          set -euo pipefail
+          # validateApiTokens only passes with a real google-services.json for
+          # com.tornets.tgx, which this build deliberately does not use.
+          ./gradlew :app:assembleLatestRelease \
+            -Pabi="$ABI" \
+            -x validateApiTokens \
+            --no-daemon \
+            --stacktrace
+
+      - name: Verify APK signature
+        id: verify
+        env:
+          BUILD_TOOLS: ${{ steps.versions.outputs.build_tools }}
+        run: |
+          set -euo pipefail
+
+          APK_DIR="app/build/outputs/apk/latest/release"
+          mapfile -t APKS < <(find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' | sort)
+
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "::error::No APK produced in $APK_DIR"
+            ls -l "$APK_DIR" || true
+            exit 1
+          fi
+
+          APKSIGNER="$ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner"
+
+          for APK in "${APKS[@]}"; do
+            APK_NAME="$(basename "$APK")"
+
+            case "$APK_NAME" in
+              *-unsigned.apk)
+                echo "::error::$APK_NAME was built without a signing config"
+                exit 1
+                ;;
+            esac
+
+            "$APKSIGNER" verify --verbose --print-certs "$APK"
+
+            ACTUAL_CERT_SHA256="$("$APKSIGNER" verify --print-certs "$APK" \
+              | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n 1 | tr 'A-F' 'a-f')"
+            if [ "$ACTUAL_CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]; then
+              echo "::error::$APK_NAME is signed with $ACTUAL_CERT_SHA256, expected $EXPECTED_CERT_SHA256"
+              exit 1
+            fi
+
+            sha256sum "$APK" > "$APK.sha256"
+            cat "$APK.sha256"
+          done
+
+          echo "Verified ${#APKS[@]} APK(s) against the org certificate"
+          echo "apk_count=${#APKS[@]}" >> "$GITHUB_OUTPUT"
+          echo "apk_dir=$APK_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Derive release metadata
+        id: meta
+        run: |
+          set -euo pipefail
+
+          APK_DIR="${{ steps.verify.outputs.apk_dir }}"
+          FIRST_APK="$(find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' | sort | head -n 1)"
+          APK_NAME="$(basename "$FIRST_APK")"
+
+          # APK name pattern: <outputFileNamePrefix>-<version>-<abi>.apk
+          # e.g. TGX-0.349.1831-arm64-v8a.apk
+          VERSION_NAME="${APK_NAME%.apk}"
+          VERSION_NAME="${VERSION_NAME#TGX-}"
+          VERSION_NAME="$(printf '%s' "$VERSION_NAME" | \
+            sed -E 's/-(arm64-v8a|armeabi-v7a|x86_64|x86|x64|arm32|arm|intel|universal)$//')"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          elif [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="v$VERSION_NAME"
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "version_name=$VERSION_NAME"
+          } >> "$GITHUB_OUTPUT"
+          echo "Tag: $TAG (version $VERSION_NAME)"
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tgx-apk
-          path: app/build/outputs/apk/latest/debug/*.apk
+          name: tgx-apk-${{ steps.meta.outputs.tag }}
+          path: |
+            app/build/outputs/apk/latest/release/*.apk
+            app/build/outputs/apk/latest/release/*.apk.sha256
           if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION_NAME: ${{ steps.meta.outputs.version_name }}
+          APK_DIR: ${{ steps.verify.outputs.apk_dir }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "Release build of the [tornets/TGX](https://github.com/tornets/TGX) fork for \`com.tornets.tgx\`."
+            echo
+            echo "- Version: \`$VERSION_NAME\`"
+            echo "- ABI: \`$ABI\`"
+            echo "- Commit: \`$(git log -1 --pretty='%h %s')\`"
+            echo "- Signed with the organization certificate, SHA-256 \`$EXPECTED_CERT_SHA256\`"
+            echo
+            echo '| File | SHA-256 |'
+            echo '| --- | --- |'
+            for checksum in "$APK_DIR"/*.apk.sha256; do
+              [ -e "$checksum" ] || continue
+              echo "| \`$(basename "${checksum%.sha256}")\` | \`$(cut -d' ' -f1 "$checksum")\` |"
+            done
+            echo
+            echo "> Firebase is not bundled in this build, so push notifications are disabled."
+            echo "> Install only over a build signed with the same certificate."
+          } > release-notes.md
+
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG already exists, uploading assets into it"
+            gh release upload "$TAG" "$APK_DIR"/*.apk "$APK_DIR"/*.apk.sha256 --clobber
+            exit 0
+          fi
+
+          args=()
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            args+=(--target "$GITHUB_SHA")
+            if [ "${{ inputs.draft }}" = "true" ]; then
+              args+=(--draft)
+            fi
+            if [ "${{ inputs.prerelease }}" = "true" ]; then
+              args+=(--prerelease)
+            fi
+          fi
+
+          gh release create "$TAG" "$APK_DIR"/*.apk "$APK_DIR"/*.apk.sha256 \
+            --title "TGX $VERSION_NAME" \
+            --notes-file release-notes.md \
+            "${args[@]}"
+
+      - name: Clean up signing material
+        if: always()
+        run: |
+          rm -f keystore.properties google-services-placeholder.json release-notes.md
+          rm -rf "$RUNNER_TEMP/signing"
