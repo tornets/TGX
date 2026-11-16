@@ -17,6 +17,15 @@ obj
 /captures
 /local.properties
 
+# Local signing material must never be committed: CI gets it from org secrets
+*.jks
+*.keystore
+keystore.properties
+
+# Local Firebase config for this fork
+/google-services-tornets.json
+/google-services-placeholder.json
+
 /tests
 
 libc++_shared.so
